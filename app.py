@@ -17,6 +17,7 @@ from pathlib import Path
 from io import BytesIO
 import shutil
 import warnings
+import bcrypt
 
 # تعطيل التحذيرات غير الضرورية
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -207,6 +208,7 @@ def ensure_db():
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
+            cur.execute("PRAGMA foreign_keys = ON")
             
             # جدول المستخدمين
             cur.execute("""CREATE TABLE IF NOT EXISTS users (
@@ -252,6 +254,21 @@ def ensure_db():
                 file_path TEXT NOT NULL
             )""")
             
+            # إنشاء الفهارس لتحسين الأداء
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_username ON reports(username)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_dates ON reports(date_from, date_to)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_procedure ON reports(procedure)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_specialties_username ON specialties(username)")
+            # قيود التفرد (محمية ضد البيانات المكررة الموجودة مسبقاً)
+            for unique_idx in (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_unique ON reports(username, period_type, date_from, date_to, procedure)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_specialties_unique ON specialties(username, procedure)",
+            ):
+                try:
+                    cur.execute(unique_idx)
+                except sqlite3.IntegrityError:
+                    pass
+            
             # التحقق من وجود عمود hospital_type
             cur.execute("PRAGMA table_info(users)")
             columns = [col[1] for col in cur.fetchall()]
@@ -264,8 +281,8 @@ def ensure_db():
                 cur.execute("""
                     INSERT INTO users 
                     (username, password, hospital, governorate, hospital_type, role, permissions) 
-                    VALUES ('admin', 'admin123', 'وزارة الصحة', 'القاهرة', 'عام', 'admin', 'all')
-                """)
+                    VALUES ('admin', ?, 'وزارة الصحة', 'القاهرة', 'عام', 'admin', 'all')
+                """, (hash_password("admin123"),))
             else:
                 cur.execute("""
                     UPDATE users SET hospital_type = 'عام' 
@@ -305,16 +322,13 @@ def import_excel_data():
             c.execute("""
                 INSERT OR REPLACE INTO users (username, password, hospital, governorate, hospital_type, role, permissions)
                 VALUES (?, ?, ?, ?, ?, 'user', '')
-            """, (username, "1234", row["hospital"].strip(), row["governorate"].strip(), row["hospital_type"].strip()))
+            """, (username, hash_password("1234"), row["hospital"].strip(), row["governorate"].strip(), row["hospital_type"].strip()))
         for _, row in df.iterrows():
             username = row["hospital"].strip().replace(" ", "_").lower()
             procedure = str(row["procedure"]).strip()
             capacity = float(row["capacity"])
-            c.execute("SELECT COUNT(*) FROM specialties WHERE username=? AND procedure=?",
-                      (username, procedure))
-            if c.fetchone()[0] == 0:
-                c.execute("INSERT INTO specialties (username, procedure, capacity) VALUES (?, ?, ?)",
-                          (username, procedure, capacity))
+            c.execute("INSERT OR IGNORE INTO specialties (username, procedure, capacity) VALUES (?, ?, ?)",
+                      (username, procedure, capacity))
         conn.commit()
     st.success("✅ تم استيراد البيانات من data.xlsx بنجاح، مع الحفاظ على تصنيفات المستشفيات.")
     st.cache_data.clear()
@@ -336,15 +350,60 @@ def export_to_excel():
 
 # ---------- الاتصال بقاعدة البيانات ----------
 def db_conn():
-    ensure_db()
     if MODULES_AVAILABLE:
         return get_db_connection()
     else:
         conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=10000")
         return conn
+
+
+# ---------- دوال كلمات المرور ----------
+def hash_password(plain: str) -> str:
+    """تشفير كلمة المرور باستخدام bcrypt."""
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def check_password(plain: str, hashed: str, username: str = None) -> bool:
+    """التحقق من كلمة المرور مع دعم كلمات المرور القديمة (نص صريح).
+
+    إذا كان الهاش المخزّن نصاً صريحاً قديماً وتطابق، تتم ترقيته تلقائياً إلى bcrypt.
+    """
+    if not hashed:
+        return False
+    if hashed.startswith(("$2a$", "$2b$", "$2y$")):
+        try:
+            return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+        except ValueError:
+            return False
+    # توافق مع كلمات المرور القديمة المخزّنة كنص صريح
+    if plain == hashed:
+        if username:
+            try:
+                with db_conn() as c:
+                    c.execute("UPDATE users SET password=? WHERE username=?",
+                              (hash_password(plain), username))
+            except Exception:
+                pass
+        return True
+    return False
+
+
+def update_password(username: str, new_pass: str) -> bool:
+    """تحديث كلمة مرور المستخدم بعد تشفيرها. ترجع False إذا كانت فارغة."""
+    if not new_pass or not new_pass.strip():
+        return False
+    with db_conn() as c:
+        c.execute("UPDATE users SET password=? WHERE username=?",
+                  (hash_password(new_pass.strip()), username))
+    return True
+
+
+# تهيئة قاعدة البيانات مرة واحدة عند بدء التطبيق
+ensure_db()
 
 # ---------- صلاحيات الأدمن ----------
 @st.cache_data(ttl=600)
@@ -381,7 +440,7 @@ def login():
             cur = c.cursor()
             cur.execute("SELECT password FROM users WHERE username = ?", (u.strip(),))
             row = cur.fetchone()
-            if row and row[0] == p.strip():
+            if row and check_password(p.strip(), row[0], u.strip()):
                 st.session_state.logged = True
                 st.session_state.user = u.strip()
                 st.rerun()
@@ -446,9 +505,13 @@ def user_view():
         if st.button("➕ إضافة مؤقتًا"):
             pdf_path = ""
             if pdf:
+                file_bytes = pdf.getbuffer()
+                if bytes(file_bytes[:4]) != b'%PDF':
+                    st.error("❌ الملف المرفوع ليس ملف PDF صحيح.")
+                    return
                 path = Path(UPLOAD_DIR) / f"{uname}_{proc}_{dfrom}.pdf"
                 with open(path, "wb") as f:
-                    f.write(pdf.getbuffer())
+                    f.write(file_bytes)
                 pdf_path = str(path)
             st.session_state.pending.append({
                 "period": period,
@@ -487,10 +550,11 @@ def user_view():
         st.text_input("اسم المستخدم", value=uname, disabled=True)
         new_pass = st.text_input("🔑 كلمة مرور جديدة", type="password")
         if st.button("🔄 تحديث كلمة المرور"):
-            with db_conn() as c:
-                c.execute("UPDATE users SET password=? WHERE username=?", (new_pass, uname))
-            st.success("✅ تم تحديث كلمة المرور. الرجاء تسجيل الدخول مجددًا.")
-            logout()
+            if update_password(uname, new_pass):
+                st.success("✅ تم تحديث كلمة المرور. الرجاء تسجيل الدخول مجددًا.")
+                logout()
+            else:
+                st.error("⚠️ كلمة المرور لا يمكن أن تكون فارغة.")
 
     elif menu == "🚪 خروج":
         if st.button("✅ تأكيد تسجيل الخروج", type="primary", use_container_width=True):
@@ -521,36 +585,87 @@ def admin_view():
 
     if menu == "📊 التقارير" and has_permission("reports"):
         st.title("📊 تقارير المستشفيات")
+        base_query = "FROM reports r JOIN users u ON r.username = u.username"
+        # جلب قوائم الفلاتر المتاحة من قاعدة البيانات
         with db_conn() as c:
-            df = pd.read_sql("""
-                SELECT r.*, u.hospital, u.governorate, u.hospital_type 
-                FROM reports r 
-                JOIN users u ON r.username = u.username
-            """, c)
-        ufilter = st.multiselect("📌 المستخدم", df["username"].unique())
-        pfilter = st.multiselect("🔧 التخصص", df["procedure"].unique())
-        gfilter = st.multiselect("🏙️ المحافظه", df["governorate"].unique())
-        tfilter = st.multiselect("🏷️ تصنيف المستشفى", df["hospital_type"].dropna().unique())
+            user_opts = pd.read_sql(f"SELECT DISTINCT r.username {base_query} ORDER BY r.username", c)["username"].tolist()
+            proc_opts = pd.read_sql(f"SELECT DISTINCT r.procedure {base_query} ORDER BY r.procedure", c)["procedure"].tolist()
+            gov_opts = pd.read_sql(f"SELECT DISTINCT u.governorate {base_query} WHERE u.governorate IS NOT NULL ORDER BY u.governorate", c)["governorate"].tolist()
+            type_opts = pd.read_sql(f"SELECT DISTINCT u.hospital_type {base_query} WHERE u.hospital_type IS NOT NULL ORDER BY u.hospital_type", c)["hospital_type"].tolist()
+
+        ufilter = st.multiselect("📌 المستخدم", user_opts)
+        pfilter = st.multiselect("🔧 التخصص", proc_opts)
+        gfilter = st.multiselect("🏙️ المحافظه", gov_opts)
+        tfilter = st.multiselect("🏷️ تصنيف المستشفى", type_opts)
         d1 = st.date_input("📅 من تاريخ")
         d2 = st.date_input("📅 إلى تاريخ")
 
+        # بناء شروط التصفية في SQL بدلاً من Python
+        clauses = []
+        params = []
         if ufilter:
-            df = df[df["username"].isin(ufilter)]
+            clauses.append(f"r.username IN ({','.join(['?'] * len(ufilter))})")
+            params.extend(ufilter)
         if pfilter:
-            df = df[df["procedure"].isin(pfilter)]
+            clauses.append(f"r.procedure IN ({','.join(['?'] * len(pfilter))})")
+            params.extend(pfilter)
         if gfilter:
-            df = df[df["governorate"].isin(gfilter)]
+            clauses.append(f"u.governorate IN ({','.join(['?'] * len(gfilter))})")
+            params.extend(gfilter)
         if tfilter:
-            df = df[df["hospital_type"].isin(tfilter)]
+            clauses.append(f"u.hospital_type IN ({','.join(['?'] * len(tfilter))})")
+            params.extend(tfilter)
         if d1 and d2:
-            df = df[(df["date_from"] >= str(d1)) & (df["date_to"] <= str(d2))]
+            clauses.append("r.date_from >= ? AND r.date_to <= ?")
+            params.extend([str(d1), str(d2)])
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        with db_conn() as c:
+            df = pd.read_sql(
+                f"SELECT r.*, u.hospital, u.governorate, u.hospital_type {base_query}{where}",
+                c, params=params
+            )
 
         # تحسين عرض البيانات
         df_display = optimize_dataframe_display(df)
         if len(df) > 100:
             df_display = paginate_dataframe(df_display)
         st.dataframe(df_display)
-        
+
+        # 🔍 كشف التقارير المكررة
+        with st.expander("🔍 كشف التقارير المكررة"):
+            with db_conn() as c:
+                df_dups = pd.read_sql("""
+                    SELECT username, period_type, date_from, date_to, procedure,
+                           COUNT(*) AS total_count,
+                           MIN(id) AS original_id,
+                           GROUP_CONCAT(id) AS all_ids
+                    FROM reports
+                    GROUP BY username, period_type, date_from, date_to, procedure
+                    HAVING COUNT(*) > 1
+                    ORDER BY total_count DESC
+                """, c)
+            if df_dups.empty:
+                st.success("✅ لا توجد تقارير مكررة.")
+            else:
+                st.warning(f"⚠️ تم اكتشاف {len(df_dups)} مجموعة تكرار.")
+                st.dataframe(df_dups)
+                if has_permission("delete_reports"):
+                    if st.button("🗑️ حذف التكرارات (الاحتفاظ بالأقدم)"):
+                        with db_conn() as c:
+                            c.execute("""
+                                DELETE FROM reports
+                                WHERE id NOT IN (
+                                    SELECT MIN(id)
+                                    FROM reports
+                                    GROUP BY username, period_type, date_from, date_to, procedure
+                                )
+                            """)
+                        st.success("✅ تم حذف التقارير المكررة.")
+                        st.rerun()
+                else:
+                    st.info("🔒 لا تملك صلاحية حذف التقارير.")
+
         output = BytesIO()
         df.to_excel(output, index=False, engine="openpyxl")
         output.seek(0)
@@ -819,7 +934,7 @@ def admin_view():
                         cur.execute("""
                             INSERT INTO users (username, password, hospital, governorate, hospital_type, role, permissions)
                             VALUES (?, ?, ?, ?, ?, 'user', '')
-                        """, (uname, pw, name, gov, hosp_type.strip()))
+                        """, (uname, hash_password(pw), name, gov, hosp_type.strip()))
                         st.success(f"✅ تم إضافة المستشفى: {name} (اسم المستخدم: {uname})")
                         st.rerun()
 
@@ -878,7 +993,7 @@ def admin_view():
                             cur.execute("""
                                 UPDATE users SET username=?, password=?, hospital=?, governorate=?, hospital_type=?
                                 WHERE hospital=?
-                            """, (new_username, new_password, new_name, new_gov, new_type, selected_hospital))
+                            """, (new_username, hash_password(new_password), new_name, new_gov, new_type, selected_hospital))
                         else:
                             cur.execute("""
                                 UPDATE users SET username=?, hospital=?, governorate=?, hospital_type=?
@@ -963,7 +1078,7 @@ def admin_view():
             if new_admin_user and new_admin_pass:
                 with db_conn() as c:
                     c.execute("INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?, ?, ?, ?)",
-                              (new_admin_user, new_admin_pass, new_admin_hospital, new_admin_gov, "عام", "admin", ",".join(selected_perms)))
+                              (new_admin_user, hash_password(new_admin_pass), new_admin_hospital, new_admin_gov, "عام", "admin", ",".join(selected_perms)))
                 st.success(f"✅ تم إضافة الأدمن '{new_admin_user}'")
                 st.rerun()
             else:
@@ -1004,9 +1119,10 @@ def admin_view():
             uname = df_users[df_users["hospital"] == hosp]["username"].values[0]
             new_pass = st.text_input("🔑 كلمة مرور جديدة")
             if st.button("🔄 تحديث"):
-                with db_conn() as c:
-                    c.execute("UPDATE users SET password=? WHERE username=?", (new_pass, uname))
-                st.success("✅ تم تحديث كلمة المرور.")
+                if update_password(uname, new_pass):
+                    st.success("✅ تم تحديث كلمة المرور.")
+                else:
+                    st.error("⚠️ كلمة المرور لا يمكن أن تكون فارغة.")
 
     # 🔐 الحساب
     elif menu == "🔐 الحساب":
@@ -1015,10 +1131,11 @@ def admin_view():
         st.text_input("اسم المستخدم", value=uname, disabled=True)
         new_pass = st.text_input("كلمة مرور جديدة", type="password")
         if st.button("تحديث"):
-            with db_conn() as c:
-                c.execute("UPDATE users SET password=? WHERE username=?", (new_pass, uname))
-            st.success("✅ تم التحديث.")
-            logout()
+            if update_password(uname, new_pass):
+                st.success("✅ تم التحديث.")
+                logout()
+            else:
+                st.error("⚠️ كلمة المرور لا يمكن أن تكون فارغة.")
 
     # 📂 مقارنة ملفات إكسيل (Snapshot Analysis)
     elif menu == "📂 مقارنة ملفات إكسيل (Snapshot Analysis)" and has_permission("admin"):

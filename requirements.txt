@@ -1,9 +1,5 @@
 streamlit
 pandas
 bcrypt
-python-multipart
 openpyxl
-xlrd
-
-
-
+reportlab
