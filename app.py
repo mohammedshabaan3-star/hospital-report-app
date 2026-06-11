@@ -495,6 +495,48 @@ def user_view():
             st.warning("⚠️ لا توجد تخصصات مسجلة.")
             return
 
+        # اختيار طريقة الإدخال: دفعة واحدة لكل التخصصات (جديد) أو تخصص واحد (الطريقة القديمة كاحتياطي)
+        entry_mode = st.radio(
+            "🧾 طريقة الإدخال",
+            ["📋 إدخال جميع التخصصات دفعة واحدة", "➕ إدخال تخصص واحد (الطريقة القديمة)"]
+        )
+
+        if entry_mode == "📋 إدخال جميع التخصصات دفعة واحدة":
+            st.subheader("📋 أدخل عدد الحالات لكل تخصص ثم احفظ دفعة واحدة")
+            with st.form(f"batch_report_form_{uname}"):
+                batch_inputs = {}
+                for _, row in df.iterrows():
+                    proc_name = row["procedure"]
+                    cap_val = row["capacity"]
+                    batch_inputs[proc_name] = st.number_input(
+                        f"🔧 {proc_name} — ⚡ السعة الاستيعابية: {cap_val}",
+                        min_value=0, step=1, key=f"batch_{uname}_{proc_name}"
+                    )
+                submitted = st.form_submit_button("📥 حفظ التقرير لجميع التخصصات")
+            if submitted:
+                saved, skipped = 0, 0
+                with db_conn() as c:
+                    for _, row in df.iterrows():
+                        proc_name = row["procedure"]
+                        cap_val = row["capacity"]
+                        cases_val = batch_inputs.get(proc_name, 0)
+                        try:
+                            c.execute("""INSERT INTO reports (
+                                username, period_type, date_from, date_to, procedure, capacity, cases, notes, pdf
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (uname, period, str(dfrom), str(dto), proc_name, cap_val, cases_val, "", ""))
+                            saved += 1
+                        except sqlite3.IntegrityError:
+                            skipped += 1
+                if saved:
+                    st.success(f"✅ تم حفظ {saved} تخصص دفعة واحدة.")
+                if skipped:
+                    st.warning(f"⚠️ تم تخطي {skipped} تخصص (يوجد تقرير مكرر لنفس الفترة مسبقًا).")
+                if not saved and not skipped:
+                    st.info("ℹ️ لا توجد تخصصات للحفظ.")
+            return
+
+        # ----- الطريقة القديمة (محفوظة كما هي كخيار احتياطي داخلي) -----
         proc = st.selectbox("🔧 اختر التخصص", df["procedure"].unique())
         cap = df[df["procedure"] == proc]["capacity"].values[0]
         st.markdown(f"⚡ السعة الاستيعابية: **{cap}**")
@@ -560,6 +602,125 @@ def user_view():
         if st.button("✅ تأكيد تسجيل الخروج", type="primary", use_container_width=True):
             logout()
 
+# ---------- مساعدات شاشة التقارير ----------
+# استعلام الأساس لشاشة التقارير (نفس الجداول ونفس الربط الحالي)
+REPORTS_BASE_QUERY = "FROM reports r JOIN users u ON r.username = u.username"
+
+# الأسماء المحتملة لعمود (إجمالي الحالات) داخل ملف الإكسيل المرفوع
+TOTAL_CASES_COLUMN_CANDIDATES = [
+    "إجمالي الحالات", "اجمالى الحالات", "إجمالى الحالات", "اجمالي الحالات",
+    "اجمالى عدد الحالات", "إجمالي عدد الحالات", "اجمالي عدد الحالات",
+]
+# أعمدة فئات الحالات التي يُشتق منها الإجمالي عند غياب عمود صريح للإجمالي
+SNAPSHOT_CASE_COMPONENT_COLUMNS = [
+    "عدد الحالات التي تمت", "عدد الحالات الجديدة", "عدد الحالات الجارية",
+    "عدد حالات تم التأجيل بناء على الحالة الصحية للمريض",
+]
+
+
+def get_report_filter_options():
+    """جلب قوائم الفلاتر المتاحة (المستخدمون، التخصصات، المحافظات، التصنيفات) من قاعدة البيانات."""
+    with db_conn() as c:
+        user_opts = pd.read_sql(f"SELECT DISTINCT r.username {REPORTS_BASE_QUERY} ORDER BY r.username", c)["username"].tolist()
+        proc_opts = pd.read_sql(f"SELECT DISTINCT r.procedure {REPORTS_BASE_QUERY} ORDER BY r.procedure", c)["procedure"].tolist()
+        gov_opts = pd.read_sql(f"SELECT DISTINCT u.governorate {REPORTS_BASE_QUERY} WHERE u.governorate IS NOT NULL ORDER BY u.governorate", c)["governorate"].tolist()
+        type_opts = pd.read_sql(f"SELECT DISTINCT u.hospital_type {REPORTS_BASE_QUERY} WHERE u.hospital_type IS NOT NULL ORDER BY u.hospital_type", c)["hospital_type"].tolist()
+    return user_opts, proc_opts, gov_opts, type_opts
+
+
+def build_reports_where(ufilter, pfilter, gfilter, tfilter, d1, d2):
+    """بناء جملة WHERE المُعلَّمة (parameterized) لتصفية التقارير داخل SQL (نفس المنطق الحالي)."""
+    clauses = []
+    params = []
+    if ufilter:
+        clauses.append(f"r.username IN ({','.join(['?'] * len(ufilter))})")
+        params.extend(ufilter)
+    if pfilter:
+        clauses.append(f"r.procedure IN ({','.join(['?'] * len(pfilter))})")
+        params.extend(pfilter)
+    if gfilter:
+        clauses.append(f"u.governorate IN ({','.join(['?'] * len(gfilter))})")
+        params.extend(gfilter)
+    if tfilter:
+        clauses.append(f"u.hospital_type IN ({','.join(['?'] * len(tfilter))})")
+        params.extend(tfilter)
+    if d1 and d2:
+        clauses.append("r.date_from >= ? AND r.date_to <= ?")
+        params.extend([str(d1), str(d2)])
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def load_reports_df(where, params):
+    """تحميل التقارير المُفلترة بنفس الاستعلام والأعمدة الحالية."""
+    with db_conn() as c:
+        return pd.read_sql(
+            f"SELECT r.*, u.hospital, u.governorate, u.hospital_type {REPORTS_BASE_QUERY}{where}",
+            c, params=params
+        )
+
+
+def get_latest_snapshot_total_cases():
+    """جلب (إجمالي الحالات) من أحدث ملف إكسيل مرفوع حسب التاريخ، مفهرسة حسب (المستشفى، التخصص).
+
+    يعتمد على عمود (إجمالي الحالات) إن وُجد صراحةً في الملف، وإلا يُشتق الإجمالي من
+    مجموع أعمدة فئات الحالات الموجودة. قراءة فقط — لا يغيّر أي جدول أو معادلة قائمة.
+    يُرجع dict بالشكل: {(hospital, procedure): total_cases}.
+    """
+    totals = {}
+    try:
+        with db_conn() as c:
+            snap = pd.read_sql(
+                "SELECT file_path FROM snapshots ORDER BY report_date DESC, id DESC LIMIT 1", c
+            )
+        if snap.empty:
+            return totals
+        file_path = snap.iloc[0]["file_path"]
+        if not file_path or not os.path.exists(file_path):
+            return totals
+        dfx = pd.read_excel(file_path)
+        if "المستشفى" not in dfx.columns or "تصنيف الاجراء" not in dfx.columns:
+            return totals
+        total_col = next((col for col in TOTAL_CASES_COLUMN_CANDIDATES if col in dfx.columns), None)
+        if total_col:
+            dfx["__total__"] = pd.to_numeric(dfx[total_col], errors="coerce").fillna(0)
+        else:
+            comp = [col for col in SNAPSHOT_CASE_COMPONENT_COLUMNS if col in dfx.columns]
+            if not comp:
+                return totals
+            dfx["__total__"] = sum(pd.to_numeric(dfx[col], errors="coerce").fillna(0) for col in comp)
+        dfx["المستشفى"] = dfx["المستشفى"].astype(str).str.strip()
+        dfx["تصنيف الاجراء"] = dfx["تصنيف الاجراء"].astype(str).str.strip()
+        grouped = dfx.groupby(["المستشفى", "تصنيف الاجراء"])["__total__"].sum()
+        totals = {key: float(val) for key, val in grouped.items()}
+    except Exception:
+        return {}
+    return totals
+
+
+def add_report_ratio_columns(df, totals):
+    """إضافة عمودي النسب المئوية للعرض فقط دون تعديل أي معادلة قائمة.
+
+    - (نسبة التنفيذ من الطاقة الاستيعابية) = cases / capacity * 100  (نفس معادلة نسبة الإشغال الحالية)
+    - (نسبة التنفيذ من إجمالي الحالات)    = cases / إجمالي الحالات * 100  (الإجمالي من أحدث ملف مرفوع)
+    """
+    if df.empty:
+        df["نسبة التنفيذ من الطاقة الاستيعابية"] = []
+        df["نسبة التنفيذ من إجمالي الحالات"] = []
+        return df
+
+    cap_ratio = (df["cases"] / df["capacity"]).replace([float('inf'), -float('inf')], None) * 100
+    df["نسبة التنفيذ من الطاقة الاستيعابية"] = cap_ratio.round(2)
+
+    total_series = df.apply(
+        lambda row: totals.get((str(row["hospital"]).strip(), str(row["procedure"]).strip())),
+        axis=1
+    )
+    total_ratio = (df["cases"] / total_series).replace([float('inf'), -float('inf')], None) * 100
+    df["نسبة التنفيذ من إجمالي الحالات"] = total_ratio.round(2)
+    return df
+
+
 # ---------- واجهة الأدمن ----------
 def admin_view():
     st.sidebar.title("👤 Admin")
@@ -585,13 +746,8 @@ def admin_view():
 
     if menu == "📊 التقارير" and has_permission("reports"):
         st.title("📊 تقارير المستشفيات")
-        base_query = "FROM reports r JOIN users u ON r.username = u.username"
         # جلب قوائم الفلاتر المتاحة من قاعدة البيانات
-        with db_conn() as c:
-            user_opts = pd.read_sql(f"SELECT DISTINCT r.username {base_query} ORDER BY r.username", c)["username"].tolist()
-            proc_opts = pd.read_sql(f"SELECT DISTINCT r.procedure {base_query} ORDER BY r.procedure", c)["procedure"].tolist()
-            gov_opts = pd.read_sql(f"SELECT DISTINCT u.governorate {base_query} WHERE u.governorate IS NOT NULL ORDER BY u.governorate", c)["governorate"].tolist()
-            type_opts = pd.read_sql(f"SELECT DISTINCT u.hospital_type {base_query} WHERE u.hospital_type IS NOT NULL ORDER BY u.hospital_type", c)["hospital_type"].tolist()
+        user_opts, proc_opts, gov_opts, type_opts = get_report_filter_options()
 
         ufilter = st.multiselect("📌 المستخدم", user_opts)
         pfilter = st.multiselect("🔧 التخصص", proc_opts)
@@ -600,31 +756,12 @@ def admin_view():
         d1 = st.date_input("📅 من تاريخ")
         d2 = st.date_input("📅 إلى تاريخ")
 
-        # بناء شروط التصفية في SQL بدلاً من Python
-        clauses = []
-        params = []
-        if ufilter:
-            clauses.append(f"r.username IN ({','.join(['?'] * len(ufilter))})")
-            params.extend(ufilter)
-        if pfilter:
-            clauses.append(f"r.procedure IN ({','.join(['?'] * len(pfilter))})")
-            params.extend(pfilter)
-        if gfilter:
-            clauses.append(f"u.governorate IN ({','.join(['?'] * len(gfilter))})")
-            params.extend(gfilter)
-        if tfilter:
-            clauses.append(f"u.hospital_type IN ({','.join(['?'] * len(tfilter))})")
-            params.extend(tfilter)
-        if d1 and d2:
-            clauses.append("r.date_from >= ? AND r.date_to <= ?")
-            params.extend([str(d1), str(d2)])
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        # بناء شروط التصفية في SQL بدلاً من Python ثم تحميل التقارير
+        where, params = build_reports_where(ufilter, pfilter, gfilter, tfilter, d1, d2)
+        df = load_reports_df(where, params)
 
-        with db_conn() as c:
-            df = pd.read_sql(
-                f"SELECT r.*, u.hospital, u.governorate, u.hospital_type {base_query}{where}",
-                c, params=params
-            )
+        # عمودا النسب المئوية (عرض فقط — يعتمدان على الحقول والمعادلات الموجودة فعليًا)
+        df = add_report_ratio_columns(df, get_latest_snapshot_total_cases())
 
         # تحسين عرض البيانات
         df_display = optimize_dataframe_display(df)
