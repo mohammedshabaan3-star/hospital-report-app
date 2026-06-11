@@ -18,6 +18,7 @@ from io import BytesIO
 import shutil
 import warnings
 import bcrypt
+import calendar
 
 # تعطيل التحذيرات غير الضرورية
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -660,6 +661,7 @@ def load_reports_df(where, params):
         )
 
 
+@st.cache_data(ttl=300)
 def get_latest_snapshot_total_cases():
     """جلب (إجمالي الحالات) من أحدث ملف إكسيل مرفوع حسب التاريخ، مفهرسة حسب (المستشفى، التخصص).
 
@@ -701,23 +703,51 @@ def get_latest_snapshot_total_cases():
 def add_report_ratio_columns(df, totals):
     """إضافة عمودي النسب المئوية للعرض فقط دون تعديل أي معادلة قائمة.
 
-    - (نسبة التنفيذ من الطاقة الاستيعابية) = cases / capacity * 100  (نفس معادلة نسبة الإشغال الحالية)
-    - (نسبة التنفيذ من إجمالي الحالات)    = cases / إجمالي الحالات * 100  (الإجمالي من أحدث ملف مرفوع)
+    نسبة التنفيذ من الطاقة الاستيعابية = cases / الطاقة المعدّلة للفترة * 100
+      الطاقة المعدّلة:
+        شهري  → capacity (كما هي)
+        يومي  → capacity / أيام_الشهر
+        أسبوعي أو مخصص → capacity / أيام_الشهر * أيام_الفترة
+    نسبة التنفيذ من إجمالي الحالات = cases / إجمالي_الحالات * 100
+    لا تنتج NaN ولا Infinity ولا قسمة على صفر.
     """
     if df.empty:
-        df["نسبة التنفيذ من الطاقة الاستيعابية"] = []
-        df["نسبة التنفيذ من إجمالي الحالات"] = []
+        df["نسبة التنفيذ من الطاقة الاستيعابية"] = pd.Series(dtype=float)
+        df["نسبة التنفيذ من إجمالي الحالات"] = pd.Series(dtype=float)
         return df
 
-    cap_ratio = (df["cases"] / df["capacity"]).replace([float('inf'), -float('inf')], None) * 100
+    def _adjusted_capacity(row):
+        cap = pd.to_numeric(row.get("capacity", 0), errors="coerce")
+        if not cap or cap == 0 or pd.isna(cap):
+            return 0.0
+        period_type = str(row.get("period_type", "شهري")).strip()
+        if period_type == "شهري":
+            return float(cap)
+        try:
+            d_from = pd.to_datetime(row["date_from"])
+            d_to   = pd.to_datetime(row["date_to"])
+            days_in_month  = calendar.monthrange(d_from.year, d_from.month)[1]
+            days_in_period = max((d_to - d_from).days + 1, 1)
+            return float(cap) / days_in_month * days_in_period
+        except Exception:
+            return float(cap)
+
+    adj_cap = df.apply(_adjusted_capacity, axis=1)
+
+    cap_ratio = df["cases"].astype(float) / adj_cap.replace(0, float("nan"))
+    cap_ratio = cap_ratio.replace([float("inf"), -float("inf")], float("nan")).fillna(0) * 100
     df["نسبة التنفيذ من الطاقة الاستيعابية"] = cap_ratio.round(2)
 
     total_series = df.apply(
-        lambda row: totals.get((str(row["hospital"]).strip(), str(row["procedure"]).strip())),
+        lambda row: totals.get(
+            (str(row.get("hospital", "")).strip(), str(row.get("procedure", "")).strip()), 0
+        ) or 0,
         axis=1
-    )
-    total_ratio = (df["cases"] / total_series).replace([float('inf'), -float('inf')], None) * 100
+    ).astype(float)
+    total_ratio = df["cases"].astype(float) / total_series.replace(0, float("nan"))
+    total_ratio = total_ratio.replace([float("inf"), -float("inf")], float("nan")).fillna(0) * 100
     df["نسبة التنفيذ من إجمالي الحالات"] = total_ratio.round(2)
+
     return df
 
 
@@ -756,86 +786,92 @@ def admin_view():
         d1 = st.date_input("📅 من تاريخ")
         d2 = st.date_input("📅 إلى تاريخ")
 
-        # بناء شروط التصفية في SQL بدلاً من Python ثم تحميل التقارير
-        where, params = build_reports_where(ufilter, pfilter, gfilter, tfilter, d1, d2)
-        df = load_reports_df(where, params)
+        # --- زر بدء التحليل ---
+        if st.button("🔍 بدء التحليل", key="btn_start_reports_analysis"):
+            where, params = build_reports_where(ufilter, pfilter, gfilter, tfilter, d1, d2)
+            df = load_reports_df(where, params)
+            df = add_report_ratio_columns(df, get_latest_snapshot_total_cases())
+            st.session_state["reports_analysis_df"] = df
+            st.session_state["reports_analysis_ready"] = True
 
-        # عمودا النسب المئوية (عرض فقط — يعتمدان على الحقول والمعادلات الموجودة فعليًا)
-        df = add_report_ratio_columns(df, get_latest_snapshot_total_cases())
-
-        # تحسين عرض البيانات
-        df_display = optimize_dataframe_display(df)
-        if len(df) > 100:
-            df_display = paginate_dataframe(df_display)
-        st.dataframe(df_display)
-
-        # 🔍 كشف التقارير المكررة
-        with st.expander("🔍 كشف التقارير المكررة"):
-            with db_conn() as c:
-                df_dups = pd.read_sql("""
-                    SELECT username, period_type, date_from, date_to, procedure,
-                           COUNT(*) AS total_count,
-                           MIN(id) AS original_id,
-                           GROUP_CONCAT(id) AS all_ids
-                    FROM reports
-                    GROUP BY username, period_type, date_from, date_to, procedure
-                    HAVING COUNT(*) > 1
-                    ORDER BY total_count DESC
-                """, c)
-            if df_dups.empty:
-                st.success("✅ لا توجد تقارير مكررة.")
-            else:
-                st.warning(f"⚠️ تم اكتشاف {len(df_dups)} مجموعة تكرار.")
-                st.dataframe(df_dups)
-                if has_permission("delete_reports"):
-                    if st.button("🗑️ حذف التكرارات (الاحتفاظ بالأقدم)"):
-                        with db_conn() as c:
-                            c.execute("""
-                                DELETE FROM reports
-                                WHERE id NOT IN (
-                                    SELECT MIN(id)
-                                    FROM reports
-                                    GROUP BY username, period_type, date_from, date_to, procedure
-                                )
-                            """)
-                        st.success("✅ تم حذف التقارير المكررة.")
-                        st.rerun()
-                else:
-                    st.info("🔒 لا تملك صلاحية حذف التقارير.")
-
-        output = BytesIO()
-        df.to_excel(output, index=False, engine="openpyxl")
-        output.seek(0)
-        st.download_button("⬇️ تحميل Excel", output, "filtered_reports.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-        st.subheader("📌 حالة إرسال التقارير")
-        with db_conn() as c:
-            df_users = pd.read_sql("SELECT username, hospital FROM users WHERE role='user'", c)
-        sent_users = df["username"].unique()
-        sent_hospitals = df_users[df_users["username"].isin(sent_users)]["hospital"].unique()
-        unsent_hospitals = df_users[~df_users["username"].isin(sent_users)]["hospital"].unique()
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("#### ✅ أرسلت")
-            st.success(f"{len(sent_hospitals)} مستشفى")
-            st.write(sent_hospitals)
-        with col2:
-            st.markdown("#### 🚫 لم ترسل")
-            st.error(f"{len(unsent_hospitals)} مستشفى")
-            st.write(unsent_hospitals)
-
-        if has_permission("delete_reports"):
-            st.subheader("🗑️ حذف تقرير محدد")
-            if not df.empty:
-                selected_id = st.selectbox("اختر رقم التقرير", df["id"].sort_values(ascending=False))
-                if st.button("🗑️ حذف التقرير"):
-                    with db_conn() as c:
-                        c.execute("DELETE FROM reports WHERE id=?", (selected_id,))
-                    st.success(f"✅ تم حذف التقرير رقم {selected_id}")
-                    st.rerun()
+        if not st.session_state.get("reports_analysis_ready", False):
+            st.info("ℹ️ اختر الفلاتر المطلوبة ثم اضغط 'بدء التحليل'.")
         else:
-            st.info("🔒 لا تملك صلاحية حذف التقارير.")
+            df = st.session_state["reports_analysis_df"]
+
+            # تحسين عرض البيانات
+            df_display = optimize_dataframe_display(df)
+            if len(df) > 100:
+                df_display = paginate_dataframe(df_display)
+            st.dataframe(df_display)
+
+            # 🔍 كشف التقارير المكررة
+            with st.expander("🔍 كشف التقارير المكررة"):
+                with db_conn() as c:
+                    df_dups = pd.read_sql("""
+                        SELECT username, period_type, date_from, date_to, procedure,
+                               COUNT(*) AS total_count,
+                               MIN(id) AS original_id,
+                               GROUP_CONCAT(id) AS all_ids
+                        FROM reports
+                        GROUP BY username, period_type, date_from, date_to, procedure
+                        HAVING COUNT(*) > 1
+                        ORDER BY total_count DESC
+                    """, c)
+                if df_dups.empty:
+                    st.success("✅ لا توجد تقارير مكررة.")
+                else:
+                    st.warning(f"⚠️ تم اكتشاف {len(df_dups)} مجموعة تكرار.")
+                    st.dataframe(df_dups)
+                    if has_permission("delete_reports"):
+                        if st.button("🗑️ حذف التكرارات (الاحتفاظ بالأقدم)"):
+                            with db_conn() as c:
+                                c.execute("""
+                                    DELETE FROM reports
+                                    WHERE id NOT IN (
+                                        SELECT MIN(id)
+                                        FROM reports
+                                        GROUP BY username, period_type, date_from, date_to, procedure
+                                    )
+                                """)
+                            st.success("✅ تم حذف التقارير المكررة.")
+                            st.rerun()
+                    else:
+                        st.info("🔒 لا تملك صلاحية حذف التقارير.")
+
+            output = BytesIO()
+            df.to_excel(output, index=False, engine="openpyxl")
+            output.seek(0)
+            st.download_button("⬇️ تحميل Excel", output, "filtered_reports.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            st.subheader("📌 حالة إرسال التقارير")
+            with db_conn() as c:
+                df_users = pd.read_sql("SELECT username, hospital FROM users WHERE role='user'", c)
+            sent_users = df["username"].unique()
+            sent_hospitals = df_users[df_users["username"].isin(sent_users)]["hospital"].unique()
+            unsent_hospitals = df_users[~df_users["username"].isin(sent_users)]["hospital"].unique()
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("#### ✅ أرسلت")
+                st.success(f"{len(sent_hospitals)} مستشفى")
+                st.write(sent_hospitals)
+            with col2:
+                st.markdown("#### 🚫 لم ترسل")
+                st.error(f"{len(unsent_hospitals)} مستشفى")
+                st.write(unsent_hospitals)
+
+            if has_permission("delete_reports"):
+                st.subheader("🗑️ حذف تقرير محدد")
+                if not df.empty:
+                    selected_id = st.selectbox("اختر رقم التقرير", df["id"].sort_values(ascending=False))
+                    if st.button("🗑️ حذف التقرير"):
+                        with db_conn() as c:
+                            c.execute("DELETE FROM reports WHERE id=?", (selected_id,))
+                        st.success(f"✅ تم حذف التقرير رقم {selected_id}")
+                        st.rerun()
+            else:
+                st.info("🔒 لا تملك صلاحية حذف التقارير.")
 
     # 📈 تقرير إحصائي مجمع
     elif menu == "📈 تقرير إحصائي مجمع" and has_permission("summary"):
@@ -1754,312 +1790,336 @@ def admin_view():
                     if len(filtered_files) < 1:
                         st.warning("⚠️ لا توجد ملفات كافية في الفترة المحددة.")
                     else:
-                        # --- قراءة جميع الملفات في الفترة ---
-                        with st.spinner("⏳ جاري قراءة الملفات..."):
-                            all_data = []
-                            progress_bar = st.progress(0)
-                            status_text = st.empty()
-                            
-                            for idx, file in enumerate(filtered_files):
-                                try:
-                                    status_text.text(f"📂 قراءة الملف {idx + 1}/{len(filtered_files)}: {file['filename']}")
-                                    
-                                    # قراءة الملف بكفاءة عالية
-                                    df_file = pd.read_excel(
-                                        file["file_path"], 
-                                        engine='openpyxl',
-                                        dtype=str,  # قراءة كل شيء كنص أولاً
-                                        na_filter=False  # تعطيل الكشف التلقائي عن NA لتحسين الأداء
-                                    )
-                                    
-                                    df_file["report_date"] = file["report_date"]
-                                    required_cols = [
-                                        "المحافظه", "المستشفى", "تصنيف المستشفى", "تصنيف الاجراء",
-                                        "عدد الحالات التي تمت"
-                                    ]
-                                    
-                                    # التحقق من الأعمدة
-                                    missing_cols = [col for col in required_cols if col not in df_file.columns]
-                                    if missing_cols:
-                                        st.error(f"❌ الملف {file['filename']} يفتقد الأعمدة: {', '.join(missing_cols)}")
-                                        continue
-                                    
-                                    # اختيار الأعمدة المطلوبة فقط
-                                    df_file = df_file[required_cols + ["report_date"]].copy()
-                                    
-                                    # تحويل عدد الحالات إلى رقم
-                                    df_file["عدد الحالات التي تمت"] = pd.to_numeric(
-                                        df_file["عدد الحالات التي تمت"], 
-                                        errors='coerce'
-                                    ).fillna(0)
-                                    
-                                    df_file.rename(columns={"عدد الحالات التي تمت": "cases"}, inplace=True)
-                                    
-                                    # إزالة الصفوف الفارغة
-                                    df_file = df_file.dropna(subset=["المستشفى", "تصنيف الاجراء"])
-                                    
-                                    all_data.append(df_file)
-                                    progress_bar.progress((idx + 1) / len(filtered_files))
-                                    
-                                except Exception as e:
-                                    st.error(f"❌ خطأ في قراءة الملف {file['filename']}: {str(e)}")
-                                    continue
-                            
-                            progress_bar.empty()
-                            status_text.empty()
+                        st.info(f"📁 عدد الملفات في الفترة: {len(filtered_files)}")
 
-                        if not all_data:
-                            st.error("❌ لم يتم قراءة أي ملف بنجاح. يرجى التحقق من:")
-                            st.markdown("""
-                            - صحة تنسيق ملفات Excel
-                            - وجود الأعمدة المطلوبة: المحافظه، المستشفى، تصنيف المستشفى، تصنيف الاجراء، عدد الحالات التي تمت
-                            - عدم وجود ملفات تالفة
-                            """)
+                        # --- زر بدء التحليل ---
+                        if st.button("🔍 بدء التحليل", key="btn_advanced_analysis"):
+                            st.session_state["advanced_analysis_triggered"] = True
+                            st.session_state["advanced_analysis_params"] = {
+                                "start_date": start_date,
+                                "end_date": end_date,
+                                "filtered_files": filtered_files
+                            }
+
+                        if not st.session_state.get("advanced_analysis_triggered", False):
+                            st.info("ℹ️ اضغط 'بدء التحليل' لبدء قراءة الملفات وتنفيذ التحليل.")
                         else:
-                            with st.spinner("⏳ جاري دمج ومعالجة البيانات..."):
-                                try:
-                                    # دمج البيانات بكفاءة
-                                    df_all = pd.concat(all_data, ignore_index=True, copy=False)
-                                    
-                                    # تحويل التاريخ
-                                    df_all["report_date"] = pd.to_datetime(df_all["report_date"])
-                                    
-                                    # تنظيف البيانات
-                                    df_all["cases"] = pd.to_numeric(df_all["cases"], errors='coerce').fillna(0)
-                                    
-                                    # إزالة المسافات الزائدة
-                                    for col in ["المحافظه", "المستشفى", "تصنيف المستشفى", "تصنيف الاجراء"]:
-                                        df_all[col] = df_all[col].astype(str).str.strip()
-                                    
-                                    st.success(f"✅ تم تحميل {len(all_data)} ملف بنجاح ({len(df_all):,} سجل)")
-                                except Exception as e:
-                                    st.error(f"❌ خطأ في معالجة البيانات: {str(e)}")
-                                    st.stop()
-
-                            # --- التصفية المتقدمة ---
-                            st.markdown("### ⚙️ التصفية المتقدمة")
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                gov_filter = st.multiselect("📍 المحافظه", df_all["المحافظه"].unique(), key="adv_gov")
-                                hosp_filter = st.multiselect("🏥 المستشفى", df_all["المستشفى"].unique(), key="adv_hosp")
-                            with col2:
-                                type_filter = st.multiselect("🏷️ تصنيف المستشفى", df_all["تصنيف المستشفى"].unique(), key="adv_type")
-                                proc_filter = st.multiselect("🛠️ التخصص", df_all["تصنيف الاجراء"].unique(), key="adv_proc")
-
-                            df_filtered = df_all.copy()
-                            if gov_filter:
-                                df_filtered = df_filtered[df_filtered["المحافظه"].isin(gov_filter)]
-                            if hosp_filter:
-                                df_filtered = df_filtered[df_filtered["المستشفى"].isin(hosp_filter)]
-                            if type_filter:
-                                df_filtered = df_filtered[df_filtered["تصنيف المستشفى"].isin(type_filter)]
-                            if proc_filter:
-                                df_filtered = df_filtered[df_filtered["تصنيف الاجراء"].isin(proc_filter)]
-
-                            st.markdown("### 📊 البيانات حسب الزمن")
-                            st.info(f"📊 إجمالي السجلات: {len(df_filtered):,}")
-                            if len(df_filtered) > 10000:
-                                st.warning("⚠️ عدد السجلات كبير جداً. سيتم عرض أول 10,000 سجل فقط.")
-                                st.dataframe(df_filtered.head(10000))
-                            else:
-                                st.dataframe(df_filtered)
-
-                            # --- تحليل الزيادة اليومية مع المنتظر ---
-                            st.markdown("### 📈 تقرير الزيادة اليومية")
-
-                            with st.spinner("⏳ جاري حساب الزيادة اليومية..."):
-                                # تجميع الحالات لكل يوم مع تفاصيل المستشفى والتخصص
-                                daily_details = df_filtered.groupby(["report_date", "المستشفى", "تصنيف الاجراء"]).agg({
-                                    "cases": "sum"
-                                }).reset_index()
-                                daily_details = daily_details.sort_values(["report_date", "المستشفى", "تصنيف الاجراء"])
-                                
-                                # حساب الزيادة لكل مستشفى وتخصص
-                                daily_details['الزيادة'] = daily_details.groupby(["المستشفى", "تصنيف الاجراء"])['cases'].diff().fillna(0).apply(lambda x: max(x, 0)).astype(int)
-                            
-                            with st.spinner("⏳ جاري حساب الحالات المنتظرة..."):
-                                # تحميل جميع الملفات مرة واحدة لتحسين الأداء
-                                files_cache = {}
+                            # --- قراءة جميع الملفات في الفترة ---
+                            with st.spinner("⏳ جاري قراءة الملفات..."):
+                                all_data = []
+                                progress_bar = st.progress(0)
                                 status_text = st.empty()
                                 
                                 for idx, file in enumerate(filtered_files):
                                     try:
-                                        status_text.text(f"📂 تحميل ملف {idx + 1}/{len(filtered_files)} للمنتظر...")
-                                        temp_df = pd.read_excel(
+                                        status_text.text(f"📂 قراءة الملف {idx + 1}/{len(filtered_files)}: {file['filename']}")
+                                        
+                                        # قراءة الملف بكفاءة عالية
+                                        df_file = pd.read_excel(
                                             file["file_path"], 
                                             engine='openpyxl',
-                                            usecols=["المستشفى", "تصنيف الاجراء", "عدد الحالات الجديدة", "عدد الحالات الجارية"],
-                                            dtype=str,
-                                            na_filter=False
+                                            dtype=str,  # قراءة كل شيء كنص أولاً
+                                            na_filter=False  # تعطيل الكشف التلقائي عن NA لتحسين الأداء
                                         )
-                                        files_cache[file["report_date"]] = temp_df
+                                        
+                                        df_file["report_date"] = file["report_date"]
+                                        required_cols = [
+                                            "المحافظه", "المستشفى", "تصنيف المستشفى", "تصنيف الاجراء",
+                                            "عدد الحالات التي تمت"
+                                        ]
+                                        
+                                        # التحقق من الأعمدة
+                                        missing_cols = [col for col in required_cols if col not in df_file.columns]
+                                        if missing_cols:
+                                            st.error(f"❌ الملف {file['filename']} يفتقد الأعمدة: {', '.join(missing_cols)}")
+                                            continue
+                                        
+                                        # اختيار الأعمدة المطلوبة فقط
+                                        df_file = df_file[required_cols + ["report_date"]].copy()
+                                        
+                                        # تحويل عدد الحالات إلى رقم
+                                        df_file["عدد الحالات التي تمت"] = pd.to_numeric(
+                                            df_file["عدد الحالات التي تمت"], 
+                                            errors='coerce'
+                                        ).fillna(0)
+                                        
+                                        df_file.rename(columns={"عدد الحالات التي تمت": "cases"}, inplace=True)
+                                        
+                                        # إزالة الصفوف الفارغة
+                                        df_file = df_file.dropna(subset=["المستشفى", "تصنيف الاجراء"])
+                                        
+                                        all_data.append(df_file)
+                                        progress_bar.progress((idx + 1) / len(filtered_files))
+                                        
                                     except Exception as e:
-                                        files_cache[file["report_date"]] = None
-                                
-                                status_text.empty()
-                                
-                                # حساب المنتظر باستخدام عمليات متجهة بدلاً من الحلقات
-                                daily_waiting = []
-                                progress_bar = st.progress(0)
-                                status_text = st.empty()
-                                total_rows = len(daily_details)
-                                
-                                for idx, (_, row) in enumerate(daily_details.iterrows()):
-                                    current_date = row["report_date"].date()
-                                    hospital = row["المستشفى"]
-                                    procedure = row["تصنيف الاجراء"]
-                                    
-                                    temp_df = files_cache.get(current_date)
-                                    waiting = 0
-                                    
-                                    if temp_df is not None:
-                                        try:
-                                            if "عدد الحالات الجديدة" in temp_df.columns and "عدد الحالات الجارية" in temp_df.columns:
-                                                # استخدام عمليات متجهة
-                                                mask = (temp_df["المستشفى"] == hospital) & (temp_df["تصنيف الاجراء"] == procedure)
-                                                filtered_temp = temp_df[mask]
-                                                
-                                                if not filtered_temp.empty:
-                                                    new_cases = pd.to_numeric(filtered_temp["عدد الحالات الجديدة"], errors='coerce').fillna(0).sum()
-                                                    ongoing_cases = pd.to_numeric(filtered_temp["عدد الحالات الجارية"], errors='coerce').fillna(0).sum()
-                                                    waiting = int(new_cases + ongoing_cases)
-                                        except Exception as e:
-                                            waiting = 0
-                                    
-                                    daily_waiting.append(waiting)
-                                    
-                                    # تحديث شريط التقدم كل 50 سجل
-                                    if idx % 50 == 0:
-                                        progress = min((idx + 1) / total_rows, 1.0)
-                                        progress_bar.progress(progress)
-                                        status_text.text(f"⏳ معالجة السجل {idx + 1}/{total_rows} ({progress*100:.1f}%)")
+                                        st.error(f"❌ خطأ في قراءة الملف {file['filename']}: {str(e)}")
+                                        continue
                                 
                                 progress_bar.empty()
                                 status_text.empty()
-                                daily_details['المنتظر'] = daily_waiting
-                                st.success(f"✅ تم حساب المنتظر لـ {len(daily_waiting):,} سجل")
-                            
-                            # حساب الإجماليات للعرض
-                            daily_totals = daily_details.groupby("report_date").agg({
-                                "cases": "sum",
-                                "الزيادة": "sum",
-                                "المنتظر": "sum"
-                            }).reset_index()
-                            daily_totals = daily_totals.sort_values("report_date")
-
-
-                            
-
-
-                            # حساب الإجمالي الكلي للزيادة خلال الفترة
-                            total_daily_increase = daily_totals["الزيادة"].sum()
-                            # حساب إجمالي المنتظر من أحدث ملف إكسيل
-                            if len(filtered_files) > 0:
-                                latest_file = filtered_files[-1]
-                                try:
-                                    latest_df = pd.read_excel(latest_file["file_path"])
-                                    if "عدد الحالات الجديدة" in latest_df.columns and "عدد الحالات الجارية" in latest_df.columns:
-                                        if gov_filter:
-                                            latest_df = latest_df[latest_df["المحافظه"].isin(gov_filter)]
-                                        if hosp_filter:
-                                            latest_df = latest_df[latest_df["المستشفى"].isin(hosp_filter)]
-                                        if type_filter:
-                                            latest_df = latest_df[latest_df["تصنيف المستشفى"].isin(type_filter)]
-                                        if proc_filter:
-                                            latest_df = latest_df[latest_df["تصنيف الاجراء"].isin(proc_filter)]
-                                        total_expected = int((latest_df["عدد الحالات الجديدة"] + latest_df["عدد الحالات الجارية"]).sum())
+    
+                            if not all_data:
+                                st.error("❌ لم يتم قراءة أي ملف بنجاح. يرجى التحقق من:")
+                                st.markdown("""
+                                - صحة تنسيق ملفات Excel
+                                - وجود الأعمدة المطلوبة: المحافظه، المستشفى، تصنيف المستشفى، تصنيف الاجراء، عدد الحالات التي تمت
+                                - عدم وجود ملفات تالفة
+                                """)
+                            else:
+                                with st.spinner("⏳ جاري دمج ومعالجة البيانات..."):
+                                    try:
+                                        # دمج البيانات بكفاءة
+                                        df_all = pd.concat(all_data, ignore_index=True, copy=False)
+                                        
+                                        # تحويل التاريخ
+                                        df_all["report_date"] = pd.to_datetime(df_all["report_date"])
+                                        
+                                        # تنظيف البيانات
+                                        df_all["cases"] = pd.to_numeric(df_all["cases"], errors='coerce').fillna(0)
+                                        
+                                        # إزالة المسافات الزائدة
+                                        for col in ["المحافظه", "المستشفى", "تصنيف المستشفى", "تصنيف الاجراء"]:
+                                            df_all[col] = df_all[col].astype(str).str.strip()
+                                        
+                                        st.success(f"✅ تم تحميل {len(all_data)} ملف بنجاح ({len(df_all):,} سجل)")
+                                    except Exception as e:
+                                        st.error(f"❌ خطأ في معالجة البيانات: {str(e)}")
+                                        st.stop()
+    
+                                # --- التصفية المتقدمة ---
+                                st.markdown("### ⚙️ التصفية المتقدمة")
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    gov_filter = st.multiselect("📍 المحافظه", df_all["المحافظه"].unique(), key="adv_gov")
+                                    hosp_filter = st.multiselect("🏥 المستشفى", df_all["المستشفى"].unique(), key="adv_hosp")
+                                with col2:
+                                    type_filter = st.multiselect("🏷️ تصنيف المستشفى", df_all["تصنيف المستشفى"].unique(), key="adv_type")
+                                    proc_filter = st.multiselect("🛠️ التخصص", df_all["تصنيف الاجراء"].unique(), key="adv_proc")
+    
+                                df_filtered = df_all.copy()
+                                if gov_filter:
+                                    df_filtered = df_filtered[df_filtered["المحافظه"].isin(gov_filter)]
+                                if hosp_filter:
+                                    df_filtered = df_filtered[df_filtered["المستشفى"].isin(hosp_filter)]
+                                if type_filter:
+                                    df_filtered = df_filtered[df_filtered["تصنيف المستشفى"].isin(type_filter)]
+                                if proc_filter:
+                                    df_filtered = df_filtered[df_filtered["تصنيف الاجراء"].isin(proc_filter)]
+    
+                                st.markdown("### 📊 البيانات حسب الزمن")
+                                st.info(f"📊 إجمالي السجلات: {len(df_filtered):,}")
+                                if len(df_filtered) > 10000:
+                                    st.warning("⚠️ عدد السجلات كبير جداً. سيتم عرض أول 10,000 سجل فقط.")
+                                    st.dataframe(df_filtered.head(10000))
+                                else:
+                                    st.dataframe(df_filtered)
+    
+                                # --- تحليل الزيادة اليومية مع المنتظر ---
+                                st.markdown("### 📈 تقرير الزيادة اليومية")
+    
+                                with st.spinner("⏳ جاري حساب الزيادة اليومية..."):
+                                    # تجميع الحالات لكل يوم مع تفاصيل المستشفى والتخصص
+                                    daily_details = df_filtered.groupby(["report_date", "المستشفى", "تصنيف الاجراء"]).agg({
+                                        "cases": "sum"
+                                    }).reset_index()
+                                    daily_details = daily_details.sort_values(["report_date", "المستشفى", "تصنيف الاجراء"])
+                                    
+                                    # حساب الزيادة لكل مستشفى وتخصص
+                                    daily_details['الزيادة'] = daily_details.groupby(["المستشفى", "تصنيف الاجراء"])['cases'].diff().fillna(0).apply(lambda x: max(x, 0)).astype(int)
+                                
+                                with st.spinner("⏳ جاري حساب الحالات المنتظرة..."):
+                                    # تحميل جميع الملفات مرة واحدة لتحسين الأداء مع كاش في session_state
+                                    cache_key = f"files_cache_{start_date}_{end_date}_{len(filtered_files)}"
+                                    if cache_key not in st.session_state:
+                                        files_cache = {}
+                                        status_text = st.empty()
+                                        for idx, file in enumerate(filtered_files):
+                                            try:
+                                                status_text.text(f"📂 تحميل ملف {idx + 1}/{len(filtered_files)} للمنتظر...")
+                                                temp_df = pd.read_excel(
+                                                    file["file_path"],
+                                                    engine='openpyxl',
+                                                    usecols=["المستشفى", "تصنيف الاجراء", "عدد الحالات الجديدة", "عدد الحالات الجارية"],
+                                                    dtype=str,
+                                                    na_filter=False
+                                                )
+                                                files_cache[file["report_date"]] = temp_df
+                                            except Exception:
+                                                files_cache[file["report_date"]] = None
+                                        st.session_state[cache_key] = files_cache
+                                        status_text.empty()
                                     else:
+                                        files_cache = st.session_state[cache_key]
+                                    
+                                    # حساب المنتظر باستخدام عمليات متجهة بدلاً من الحلقات
+                                    daily_waiting = []
+                                    progress_bar = st.progress(0)
+                                    status_text = st.empty()
+                                    total_rows = len(daily_details)
+                                    
+                                    for idx, (_, row) in enumerate(daily_details.iterrows()):
+                                        current_date = row["report_date"].date()
+                                        hospital = row["المستشفى"]
+                                        procedure = row["تصنيف الاجراء"]
+                                        
+                                        temp_df = files_cache.get(current_date)
+                                        waiting = 0
+                                        
+                                        if temp_df is not None:
+                                            try:
+                                                if "عدد الحالات الجديدة" in temp_df.columns and "عدد الحالات الجارية" in temp_df.columns:
+                                                    # استخدام عمليات متجهة
+                                                    mask = (temp_df["المستشفى"] == hospital) & (temp_df["تصنيف الاجراء"] == procedure)
+                                                    filtered_temp = temp_df[mask]
+                                                    
+                                                    if not filtered_temp.empty:
+                                                        new_cases = pd.to_numeric(filtered_temp["عدد الحالات الجديدة"], errors='coerce').fillna(0).sum()
+                                                        ongoing_cases = pd.to_numeric(filtered_temp["عدد الحالات الجارية"], errors='coerce').fillna(0).sum()
+                                                        waiting = int(new_cases + ongoing_cases)
+                                            except Exception as e:
+                                                waiting = 0
+                                        
+                                        daily_waiting.append(waiting)
+                                        
+                                        # تحديث شريط التقدم كل 50 سجل
+                                        if idx % 50 == 0:
+                                            progress = min((idx + 1) / total_rows, 1.0)
+                                            progress_bar.progress(progress)
+                                            status_text.text(f"⏳ معالجة السجل {idx + 1}/{total_rows} ({progress*100:.1f}%)")
+                                    
+                                    progress_bar.empty()
+                                    status_text.empty()
+                                    daily_details['المنتظر'] = daily_waiting
+                                    st.success(f"✅ تم حساب المنتظر لـ {len(daily_waiting):,} سجل")
+                                
+                                # حساب الإجماليات للعرض
+                                daily_totals = daily_details.groupby("report_date").agg({
+                                    "cases": "sum",
+                                    "الزيادة": "sum",
+                                    "المنتظر": "sum"
+                                }).reset_index()
+                                daily_totals = daily_totals.sort_values("report_date")
+    
+    
+                                
+    
+    
+                                # حساب الإجمالي الكلي للزيادة خلال الفترة
+                                total_daily_increase = daily_totals["الزيادة"].sum()
+                                # حساب إجمالي المنتظر من أحدث ملف إكسيل
+                                if len(filtered_files) > 0:
+                                    latest_file = filtered_files[-1]
+                                    try:
+                                        latest_df = pd.read_excel(latest_file["file_path"])
+                                        if "عدد الحالات الجديدة" in latest_df.columns and "عدد الحالات الجارية" in latest_df.columns:
+                                            if gov_filter:
+                                                latest_df = latest_df[latest_df["المحافظه"].isin(gov_filter)]
+                                            if hosp_filter:
+                                                latest_df = latest_df[latest_df["المستشفى"].isin(hosp_filter)]
+                                            if type_filter:
+                                                latest_df = latest_df[latest_df["تصنيف المستشفى"].isin(type_filter)]
+                                            if proc_filter:
+                                                latest_df = latest_df[latest_df["تصنيف الاجراء"].isin(proc_filter)]
+                                            total_expected = int((latest_df["عدد الحالات الجديدة"] + latest_df["عدد الحالات الجارية"]).sum())
+                                        else:
+                                            total_expected = 0
+                                    except:
                                         total_expected = 0
-                                except:
+                                else:
                                     total_expected = 0
-                            else:
-                                total_expected = 0
-
-                            # عرض الجدول التفصيلي
-                            daily_display = daily_details.copy()
-                            daily_display["report_date"] = daily_display["report_date"].dt.strftime("%Y-%m-%d")
-                            daily_display.rename(columns={
-                                "report_date": "التاريخ",
-                                "المستشفى": "المستشفى",
-                                "تصنيف الاجراء": "تصنيف الاجراء",
-                                "cases": "عدد الحالات",
-                                "الزيادة": "الزيادة",
-                                "المنتظر": "المنتظر"
-                            }, inplace=True)
-
-                            st.info(f"📊 إجمالي السجلات: {len(daily_display):,}")
-                            if len(daily_display) > 5000:
-                                st.warning("⚠️ عدد السجلات كبير. سيتم عرض أول 5,000 سجل فقط في الجدول.")
-                                st.dataframe(daily_display.head(5000), use_container_width=True)
-                            else:
-                                st.dataframe(daily_display, use_container_width=True)
-
-                            # عرض الإجماليات
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.markdown(f"### ✅ **إجمالي الزيادة: {int(total_daily_increase):,} حالة**")
-                            with col2:
-                                st.markdown(f"### ⏳ **إجمالي المنتظر: {int(total_expected):,} حالة**")
-
-                            # --- رسوم بيانية ---
-                            st.markdown("### 📉 الرسوم البيانية")
-
-                            fig_line = px.line(
-                                daily_totals,
-                                x="report_date",
-                                y="cases",
-                                markers=True,
-                                title="📈 إجمالي الحالات اليومية",
-                                labels={"report_date": "التاريخ", "cases": "عدد الحالات"}
-                            )
-                            st.plotly_chart(fig_line, use_container_width=True)
-
-                            fig_bar = px.bar(
-                                daily_totals,
-                                x="report_date",
-                                y="الزيادة",
-                                title="📊 الزيادة اليومية",
-                                labels={"report_date": "التاريخ", "الزيادة": "الزيادة"}
-                            )
-                            st.plotly_chart(fig_bar, use_container_width=True)
-                            
-                            # رسم بياني للمنتظر
-                            fig_expected = px.line(
-                                daily_totals,
-                                x="report_date",
-                                y="المنتظر",
-                                markers=True,
-                                title="⏳ الحالات المنتظرة (متوسط متحرك)",
-                                labels={"report_date": "التاريخ", "المنتظر": "المنتظر"}
-                            )
-                            st.plotly_chart(fig_expected, use_container_width=True)
-
-                            # --- تصدير التقرير النهائي مع الأعمدة الجديدة ---
-                            st.markdown("### 📥 تنزيل التقرير النهائي")
-                            output = BytesIO()
-                            with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                                # ورقة التقرير اليومي مع الأعمدة الجديدة
-                                daily_display.to_excel(writer, index=False, sheet_name="التقرير اليومي")
-                                # ورقة البيانات الخام
-                                df_filtered.to_excel(writer, index=False, sheet_name="البيانات الخام")
-                                # ورقة الملخص
-                                summary_data = pd.DataFrame({
-                                    "المؤشر": ["إجمالي الزيادة", "إجمالي المنتظر", "عدد الأيام", "متوسط الزيادة اليومية"],
-                                    "القيمة": [int(total_daily_increase), int(total_expected), len(daily_display), int(total_daily_increase/len(daily_display)) if len(daily_display) > 0 else 0]
-                                })
-                                summary_data.to_excel(writer, index=False, sheet_name="الملخص")
-                            output.seek(0)
-                            st.download_button(
-                                "⬇️ تنزيل التقرير النهائي مع الأعمدة الجديدة",
-                                output,
-                                f"تقرير_يومي_متقدم_{start_date}_الى_{end_date}.xlsx",
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key="download_advanced_report"
-                            )
+    
+                                # عرض الجدول التفصيلي
+                                daily_display = daily_details.copy()
+                                daily_display["report_date"] = daily_display["report_date"].dt.strftime("%Y-%m-%d")
+                                daily_display.rename(columns={
+                                    "report_date": "التاريخ",
+                                    "المستشفى": "المستشفى",
+                                    "تصنيف الاجراء": "تصنيف الاجراء",
+                                    "cases": "عدد الحالات",
+                                    "الزيادة": "الزيادة",
+                                    "المنتظر": "المنتظر"
+                                }, inplace=True)
+    
+                                st.info(f"📊 إجمالي السجلات: {len(daily_display):,}")
+                                if len(daily_display) > 5000:
+                                    st.warning("⚠️ عدد السجلات كبير. سيتم عرض أول 5,000 سجل فقط في الجدول.")
+                                    st.dataframe(daily_display.head(5000), use_container_width=True)
+                                else:
+                                    st.dataframe(daily_display, use_container_width=True)
+    
+                                # عرض الإجماليات
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.markdown(f"### ✅ **إجمالي الزيادة: {int(total_daily_increase):,} حالة**")
+                                with col2:
+                                    st.markdown(f"### ⏳ **إجمالي المنتظر: {int(total_expected):,} حالة**")
+    
+                                # --- رسوم بيانية ---
+                                st.markdown("### 📉 الرسوم البيانية")
+    
+                                fig_line = px.line(
+                                    daily_totals,
+                                    x="report_date",
+                                    y="cases",
+                                    markers=True,
+                                    title="📈 إجمالي الحالات اليومية",
+                                    labels={"report_date": "التاريخ", "cases": "عدد الحالات"}
+                                )
+                                st.plotly_chart(fig_line, use_container_width=True)
+    
+                                fig_bar = px.bar(
+                                    daily_totals,
+                                    x="report_date",
+                                    y="الزيادة",
+                                    title="📊 الزيادة اليومية",
+                                    labels={"report_date": "التاريخ", "الزيادة": "الزيادة"}
+                                )
+                                st.plotly_chart(fig_bar, use_container_width=True)
+                                
+                                # رسم بياني للمنتظر
+                                fig_expected = px.line(
+                                    daily_totals,
+                                    x="report_date",
+                                    y="المنتظر",
+                                    markers=True,
+                                    title="⏳ الحالات المنتظرة (متوسط متحرك)",
+                                    labels={"report_date": "التاريخ", "المنتظر": "المنتظر"}
+                                )
+                                st.plotly_chart(fig_expected, use_container_width=True)
+    
+                                # --- تصدير التقرير النهائي مع الأعمدة الجديدة ---
+                                st.markdown("### 📥 تنزيل التقرير النهائي")
+                                output = BytesIO()
+                                with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                                    # ورقة التقرير اليومي مع الأعمدة الجديدة
+                                    daily_display.to_excel(writer, index=False, sheet_name="التقرير اليومي")
+                                    # ورقة البيانات الخام
+                                    df_filtered.to_excel(writer, index=False, sheet_name="البيانات الخام")
+                                    # ورقة الملخص
+                                    summary_data = pd.DataFrame({
+                                        "المؤشر": ["إجمالي الزيادة", "إجمالي المنتظر", "عدد الأيام", "متوسط الزيادة اليومية"],
+                                        "القيمة": [int(total_daily_increase), int(total_expected), len(daily_display), int(total_daily_increase/len(daily_display)) if len(daily_display) > 0 else 0]
+                                    })
+                                    summary_data.to_excel(writer, index=False, sheet_name="الملخص")
+                                output.seek(0)
+                                st.download_button(
+                                    "⬇️ تنزيل التقرير النهائي مع الأعمدة الجديدة",
+                                    output,
+                                    f"تقرير_يومي_متقدم_{start_date}_الى_{end_date}.xlsx",
+                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key="download_advanced_report"
+                                )
 
     # 📊 تقارير Snapshot المتقدمة
     elif menu == "📊 تقارير Snapshot المتقدمة" and has_permission("admin") and SNAPSHOT_REPORTS_AVAILABLE:
-        display_snapshot_analysis()
+        st.title("📊 تقارير Snapshot المتقدمة")
+        if not st.session_state.get("snapshot_analysis_triggered", False):
+            st.info("ℹ️ اضغط الزر أدناه لبدء تحميل وتحليل بيانات Snapshot.")
+            if st.button("🔍 بدء تحليل Snapshot", key="btn_snapshot_analysis"):
+                st.session_state["snapshot_analysis_triggered"] = True
+                st.rerun()
+        else:
+            display_snapshot_analysis()
 
     elif menu == "🚪 خروج":
         st.title("🚪 تسجيل الخروج")
